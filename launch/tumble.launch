@@ -1,0 +1,5 @@
+<launch>
+	<node name="pcd_from_kinect" pkg="duplo_v1" type="read_pcd" respawn="false"/>
+	<node name="my_spread_server" pkg="duplo_v1" type="spread" respawn="false" />
+	<node name="tumble_server" pkg="duplo_v1" type="tumble" respawn="false" />
+</launch>

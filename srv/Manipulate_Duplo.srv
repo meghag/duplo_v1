@@ -1,0 +1,8 @@
+sensor_msgs/PointCloud2[] target_cloud
+
+#Action to be taken: 1 = Spread, 2 = Tumble
+int32 action
+
+geometry_msgs/Point[] table_extent
+---
+bool done

@@ -1,0 +1,6 @@
+<launch>
+	<node name="manipulator" pkg="duplo_v1" type="mt" output="screen" respawn="false" />
+	<node name="process_pcd_naive" pkg="duplo_v1" type="process_pcd_naive" output="screen" respawn="false" />
+	<!-- <node name="grasp_duplo" pkg="duplo_v1" type="pick_n_place" output="screen" respawn="false" /> -->
+	<node name="pcd_from_kinect" pkg="duplo_v1" type="read_pcd" output="screen"/>
+</launch>

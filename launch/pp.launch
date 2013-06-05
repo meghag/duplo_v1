@@ -1,0 +1,3 @@
+<launch>
+	<node name="manipulator" pkg="duplo_v1" type="pick_place_color" respawn="true"/>
+</launch>

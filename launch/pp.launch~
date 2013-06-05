@@ -1,0 +1,6 @@
+<launch>
+	<node name="tumble_server" pkg="duplo_v1" type="tumble" respawn="false" />
+	<node name="pcd_from_kinect" pkg="duplo_v1" type="read_pcd" respawn="false"/>
+	<node name="manipulator" pkg="duplo_v1" type="pick_place_color" respawn="false"/>
+	<node name="my_spread_server" pkg="duplo_v1" type="spread" respawn="false" />
+</launch>

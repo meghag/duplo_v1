@@ -1,0 +1,6 @@
+<launch>
+  <node name="pr2_gripper_grasp_planner_cluster" pkg="pr2_gripper_grasp_planner_cluster" 
+    type="pr2_gripper_grasp_planner_cluster_server.py" respawn="false" output="screen">
+	<param name="z_up_frame" value="/base_link"/>
+  </node>  
+</launch>
