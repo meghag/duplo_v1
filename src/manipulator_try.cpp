@@ -1,0 +1,952 @@
+#include "manipulator_try.h"
+
+namespace sort_duplos
+{
+	Manipulator::Manipulator(ros::NodeHandle & n, int option): n_(n), option_(option)
+	{
+		manipulate_service_called_ = false;
+		manipulate_service_ = n_.advertiseService("manipulate_duplo", &Manipulator::callback, this);
+		marker_pub_ = n_.advertise<visualization_msgs::Marker>("manipulator_marker", 10);
+		target_pub_ = n_.advertise<sensor_msgs::PointCloud2>("manipulation_target",1);
+		spread_cloud_pub_ = n_.advertise<sensor_msgs::PointCloud2>("to_spread",1);
+		tumble_cloud_pub_ = n_.advertise<sensor_msgs::PointCloud2>("to_tumble",1);
+		bbx_pub_ = n_.advertise<visualization_msgs::Marker>("target_bbx",1);
+		//target_object_pub_ = n_.advertise<sensor_msgs::PointCloud2>("target_object",1);
+		collision_object_pub_ = n_.advertise<arm_navigation_msgs::CollisionObject>("collision_object", 10);
+		bbx_pose_pub_ = n_.advertise<geometry_msgs::PoseStamped>("bbx_pose", 1);
+		arm_destpose_pub = n_.advertise<geometry_msgs::PoseStamped>("arm_destpose", 1);
+		cartesian_client_ = n_.serviceClient<duplo_v1::ExecuteCartesianIKTrajectory>("execute_cartesian_ik_trajectory");
+	
+		shape[0] = visualization_msgs::Marker::CUBE;
+		shape[1] = visualization_msgs::Marker::SPHERE;
+		shape[2] = visualization_msgs::Marker::CYLINDER;
+		shape[3] = visualization_msgs::Marker::CUBE;
+
+		reset_posn_.point.x = 0.68;	reset_posn_.point.y = -0.5; reset_posn_.point.z = 1;
+		reset_posn_.header.frame_id = "base_link";
+
+		LEFT_RESET.x = 0.3;
+		LEFT_RESET.y = 0.7; //0.5
+		LEFT_RESET.z = 1.1; //1.0
+		RIGHT_RESET.x = 0.3;
+		RIGHT_RESET.y = -0.7;  //-0.5
+		RIGHT_RESET.z = 1.1;   //1.0
+
+		//RED.x = 0.4;  RED.y = -0.5; RED.z = 1.0;  //Red bin
+		//BLUE.x = 0.5;  BLUE.y = -0.5; BLUE.z = 1.0;	//Blue bin
+		//GREEN.x = 0.6; GREEN.y = -0.5; GREEN.z = 1.0;  //Green bin
+
+		RED.x = 0.5;  RED.y = -0.5; RED.z = 1.0;  //Red bin
+		BLUE.x = 0.5;  BLUE.y = -0.6; BLUE.z = 1.0;	//Blue bin
+		GREEN.x = 0.5; GREEN.y = -0.7; GREEN.z = 1.0;  //Green bin
+
+		active_arm_ = "left_arm";
+		active_arm_sym_ = 0;
+		active_reset_ = LEFT_RESET;
+		count_pp = count_spread = count_tumble = 0;
+
+		ros::service::waitForService(SET_PLANNING_SCENE_DIFF_NAME);
+		get_planning_scene_client_ = n_.serviceClient<arm_navigation_msgs::GetPlanningScene>(SET_PLANNING_SCENE_DIFF_NAME);
+		get_collision_objects_client_ = n_.serviceClient<arm_navigation_msgs::GetCollisionObjects>(GET_COLLISION_OBJECTS_NAME);
+		bbx_client_ = n_.serviceClient<object_manipulation_msgs::FindClusterBoundingBox2>("/find_cluster_bounding_box2");
+	}
+
+	Manipulator::~Manipulator() {}
+
+	geometry_msgs::Point Manipulator::find_centroid(pcl::PointCloud<PointXYZRGB> pcd)
+	{
+		ROS_INFO("Inside find_centroid");
+		double avgx = 0.0, avgy = 0.0, avgz = 0.0;
+		geometry_msgs::Point position;
+		for (std::vector<PointXYZRGB, Eigen::aligned_allocator<PointXYZRGB> >::iterator it = pcd.points.begin();
+		     it != pcd.points.end(); ++it) {
+				 avgx += it->x;      avgy += it->y;      avgz += it->z;
+			 }
+		position.x = avgx/pcd.points.size();
+		position.y = avgy/pcd.points.size();
+		position.z = avgz/pcd.points.size();
+
+		return position;
+	} //End function find_centroid
+
+	void Manipulator::minmax3d(tf::Vector3 &min, tf::Vector3 &max, pcl::PointCloud<PointXYZRGB>::Ptr &cloud)
+	{
+		Eigen::Vector4f  	min_pt, max_pt;
+		pcl::getMinMax3D 	( *cloud,min_pt,max_pt );
+		min = tf::Vector3(min_pt.x(),min_pt.y(),min_pt.z());
+		max = tf::Vector3(max_pt.x(),max_pt.y(),max_pt.z());
+	}
+
+	bool Manipulator::callback(duplo_v1::Manipulate_Duplo::Request &req,
+			duplo_v1::Manipulate_Duplo::Response &res)
+	{
+		ROS_INFO("Received cloud to manipulate.");
+		vec_target_cloud2_ = req.target_cloud;
+		ROS_INFO("Size of target cloud = %zu", vec_target_cloud2_.size());
+
+		table_extent_ = req.table_extent;
+		active_arm_ = "right_arm";
+		active_arm_sym_ = 1;
+		active_reset_ = RIGHT_RESET;
+
+		for (size_t i = 0; i < vec_target_cloud2_.size(); i++)
+		{
+			vec_target_cloud2_[i].header.frame_id = "base_link";
+			vec_target_cloud2_[i].header.stamp = ros::Time::now();
+			target_cloud2_ = vec_target_cloud2_[i];
+
+			// 1. Remove all collision objects
+			ROS_INFO("Removing all collision objects.");
+			resetCollisionModels();
+
+			// 2. Get bounding box of target cloud
+			ROS_INFO("Finding bounding box of cloud");
+			getClusterBoundingBox(target_cloud2_, bbx_.pose_stamped, bbx_.dimensions);
+
+			// 3. Add this bounding box as a collision object
+			ROS_INFO("Adding a collision object for cloud");
+			processCollisionGeometryForBoundingBox(bbx_, collision_name_);
+
+			res.done = true;
+			if (req.action == 0) { //Pick and place
+				if (!pick_n_place())
+					res.done = false;
+				gripper_.open();
+			} else if (req.action == 1) {//Spread
+				if (!spread())
+					res.done = false;
+			} else if (req.action == 2) {//Tumble
+				if (!tumble())
+					res.done = false;
+			}
+			ROS_ERROR("counts: pp = %d, spread = %d, tumble = %d", count_pp, count_spread, count_tumble);
+		}
+		return true;
+	}
+
+	bool Manipulator::pick_n_place()
+	{
+		manipulate_service_called_ = true;
+		target_pub_.publish(target_cloud2_);
+		visualization_msgs::Marker bbx_marker = set_marker("base_link", "bbx", 1, visualization_msgs::Marker::CUBE,
+				bbx_.pose_stamped.pose, bbx_.dimensions, 1.0f, 1.0f, 0.0f, 1.0);
+		bbx_pub_.publish(bbx_marker);
+		bbx_pose_pub_.publish(bbx_);
+		gripper_.open();
+
+		geometry_msgs::Point center = bbx_.pose_stamped.pose.position;
+		geometry_msgs::Point temp = center;
+
+		geometry_msgs::PoseStamped dest_pose;
+		dest_pose.header.frame_id = "base_link";
+		dest_pose.header.stamp = ros::Time::now();
+		dest_pose.pose.orientation.x = 0.0;
+		dest_pose.pose.orientation.y = 0.0;
+		dest_pose.pose.orientation.z = 0.0;
+		dest_pose.pose.orientation.w = 1.0;
+		
+		//move_arm(findPlaceLocation(), 1, 0, 1, 0);
+		temp.z += 0.2;	
+		dest_pose.pose.position = temp;
+		arm_destpose_pub.publish(dest_pose);
+		
+		if (move_arm(temp, 1, 0, 2, 0) == 0) {
+			temp.z -= 0.18;
+			dest_pose.pose.position = temp;
+			arm_destpose_pub.publish(dest_pose);
+			if (move_arm(temp, 1, 0, 2, 0) == 0) {
+				count_pp++;
+				gripper_.close();
+				temp.z += 0.2;
+				dest_pose.pose.position = temp;
+				arm_destpose_pub.publish(dest_pose);
+				move_arm(temp, 1, 0, 2, 0);
+				move_arm(findPlaceLocation(), 1, 0, 2, 1);
+				gripper_.open();
+			} else {
+				move_arm(findPlaceLocation(), 1, 0, 2, 1);
+				return false;
+			}
+		} else
+			return false;
+
+//		breakpoint();
+		return true;
+	}
+
+	bool Manipulator::spread()
+	{
+		target_pub_.publish(target_cloud2_);
+		ROS_INFO("DUPLO: Finding central cluster");
+		pcl::PointCloud<pcl::PointXYZRGB> pcd;
+		fromROSMsg(target_cloud2_,pcd);
+		spread_path_ = find_spread_path(pcd);
+
+		// Publish the central markers
+		for (size_t i = 0; i < spread_path_.size(); i++)
+			marker_pub_.publish(set_marker("base_link","central",i,shape[1],spread_path_[i],0.02,0.0f,1.0f,0.0f,1.0));
+
+		ROS_INFO("Calling move arm");
+
+		//Spread
+		gripper_.close();
+		int move_count = 0;
+		//move_arm(reset_posn_.point,1,1,2,1);
+		//for (int plan_id = 1; plan_id <= 1; plan_id++) {
+		int plan_id = 1;
+		if (move_arm(spread_path_[0], 1, 0, plan_id, 1) != -1)
+		{
+			move_count++;
+			count_spread++;
+			/*duplo_v1::ExecuteCartesianIKTrajectory cartesian_call;
+			cartesian_call.request.header.frame_id = "base_link";
+			cartesian_call.request.header.stamp = ros::Time::now();
+
+			geometry_msgs::Pose pose;
+			pose.orientation.x = -0.74;
+			pose.orientation.y = -0.04; 
+			pose.orientation.z = 0.67;
+			pose.orientation.w = -0.04; */
+			for (size_t i = 1; i < spread_path_.size(); i++) {	
+				if (move_arm(spread_path_[i], 1, 0, plan_id, 1) != -1)
+					move_count++;		
+			}
+			/*	pose.position = spread_path_[i];
+				cartesian_call.request.poses.push_back(pose);
+			}
+			
+			if (cartesian_client_.call(cartesian_call)) {
+				ROS_INFO("Called the cartesian controller");
+			} else {
+				ROS_ERROR("Failed to call cartesian controller");
+				//					return false;
+			}
+			if (cartesian_call.response.success)
+				move_count++;	*/
+		}
+
+		//move_arm(reset_posn_.point,1,0,2, 1);
+
+		ROS_INFO("Move count = %d", move_count);
+		//breakpoint();
+
+		manipulate_service_called_ = true;
+		if (move_count > 2)
+//		if (move_count == 2)
+			return true;
+		else 
+			return false;
+	}
+
+	bool Manipulator::tumble()
+	{
+		target_pub_.publish(target_cloud2_);
+		pcl::PointCloud<pcl::PointXYZRGB> pcd;
+		fromROSMsg(target_cloud2_,pcd);
+		ROS_INFO("DUPLO: Finding waypoints");
+		tumble_waypoints_ = find_waypoints(pcd);
+
+		reset_posn_.header.stamp = tumble_waypoints_[0].header.stamp;
+		//waypoints.push_back(reset_posn_);
+
+		ROS_INFO("Calling move arm");
+		gripper_.close();
+		int move_count = 0;
+		int plan_id;
+		//	move_arm_tumble(waypoints[3].point);
+		for (plan_id = 1; plan_id <= 2 ; plan_id++) {
+			for (size_t i = 0; i < 3; i++) {
+				if (move_arm(tumble_waypoints_[3*plan_id-3+i].point, 1, 0, plan_id, 2) != -1) {
+					move_count++;
+					if (i == 0) count_tumble++;
+				}
+			}
+			if (move_count >= 2)
+				break;
+			else if (plan_id != 2)
+				move_count = 0;
+		}
+		move_arm(tumble_waypoints_[12].point, 1, 0, plan_id, 2);
+
+		move_arm(reset_posn_.point, 1, 0, 2, 1);
+		//move_arm(reset_posn_.point, 1, 0, 1, 2);
+		//	head.lookAt("base_link", 0.2, 0.0, 1.0);
+		manipulate_service_called_ = true;
+		if (move_count < 2)
+			return false;
+		else
+			return true;
+	}
+
+	geometry_msgs::Point Manipulator::findPlaceLocation()
+	{
+		geometry_msgs::Point big, medium, small;
+		big = RED; 		medium = BLUE;		small = GREEN;
+
+		pcl::PointCloud<pcl::PointXYZRGB> temp;
+		fromROSMsg(target_cloud2_,temp);
+		
+		if (option_ == 0) {
+			//Sorting by Color
+			// unpack rgb into r/g/b and find the avg r/g/b of the cluster
+			size_t num_pts = temp.points.size();
+			uint32_t rsum = 0,gsum = 0,bsum = 0;
+			uint8_t r,g,b;
+			for (size_t i = 0; i < num_pts; i++) {
+				uint32_t rgb = *reinterpret_cast<int*>(&temp.points[i].rgb);
+				rsum = rsum + ((rgb >> 16) & 0x0000ff);
+				gsum = gsum + ((rgb >> 8)  & 0x0000ff);
+				bsum = bsum + ((rgb)       & 0x0000ff);
+			}
+			r = std::floor(rsum/num_pts);
+			g = std::floor(gsum/num_pts);
+			b = std::floor(bsum/num_pts);
+			ROS_INFO("PP: Avg RGB of cluster: %d, %d, %d",r,g,b);
+			uint8_t max_col = std::max(r,g);
+			max_col = std::max(max_col,b);
+			if (max_col == r) {
+				ROS_INFO("PP: Placing block into the red bin.");
+				return RED;
+			} else if (max_col == g) {
+				ROS_INFO("PP: Placing block into the green bin.");
+				return GREEN;
+			} else if (max_col == b) {
+				ROS_INFO("PP: Placing block into the blue bin.");
+				return BLUE;
+			}
+		} else if (option_ == 1) {
+			//Sorting by size
+			float longest_dim = findLongestDim(temp);
+			ROS_INFO("PP: Longest dimension of cluster = %f", longest_dim);
+			if (longest_dim > 0.09) {
+				//Place in size A bin
+				ROS_INFO("PP: Placing in big bin");
+				return RED;
+			} else if (longest_dim >= 0.05 && longest_dim <= 0.08) {
+				//Place in size B bin
+				ROS_INFO("PP: Placing in medium bin");
+				return GREEN;
+			} else if (longest_dim < 0.05) {
+				//Place in size C bin
+				ROS_INFO("PP: Placing in small bin");
+				return BLUE;
+			}
+		}
+		return RED;
+	} //end function PlaceObject
+
+	std::vector<geometry_msgs::Point> Manipulator::find_spread_path(pcl::PointCloud<pcl::PointXYZRGB> pcd)
+	{ 
+		//TODO: Find bbx of the spread cloud and calculate spread directions based on that.
+
+		sensor_msgs::PointCloud2 pcd2;
+		//toROSMsg(pcd, pcd2);
+		ROS_INFO("DUPLO: Inside Find path");
+		ROS_INFO("DUPLO: Frame id: %s",target_cloud2_.header.frame_id.c_str());
+		std::vector<geometry_msgs::Point> cloud_extent = find_extents(pcd);
+		PointCloud<PointXYZRGB>::Ptr pcd_ptr(new PointCloud<PointXYZRGB>);
+		*pcd_ptr = pcd;
+		vector<sensor_msgs::PointCloud2> clusters = cluster_regions(pcd_ptr,0);
+
+		vector<geometry_msgs::Point> path;
+		geometry_msgs::Point center, temp;
+		sensor_msgs::PointCloud2 central_duplo2;
+		PointCloud<PointXYZRGB> central;
+
+		if (clusters.size() > 15) {
+			//Too many duplos in the region. Just go to the center and spread.
+			//center.x = cloud_extent[0].x + (cloud_extent[1].x - cloud_extent[0].x)*0.5;
+			//center.y = cloud_extent[2].y + (cloud_extent[3].y - cloud_extent[2].y)*0.5;
+			//center.z = cloud_extent[4].z + 0.01;	//(cloud_extent[5].z - cloud_extent[4].z)*0.5;
+			//temp = center;
+			central_duplo2 = clusters[9];
+		} else {
+			vector<int> count;
+			for (size_t i = 0; i < clusters.size(); i++)
+				count.push_back(0);
+
+			for (size_t i = 0; i < clusters.size()-1; i++) {
+				for (size_t j = i+1; j < clusters.size(); j++) {
+					//ROS_INFO("DUPLO: Inside in contact for loop region %d",region_id);
+					pcl::PointCloud<PointXYZRGB> temp1, temp2;
+					fromROSMsg(clusters[i], temp1);
+					fromROSMsg(clusters[j], temp2);
+
+					if (incontact(temp1, temp2)) {
+						//The two clusters are closer than 1.5 cm
+						count[i] = count[i]+1;
+						count[j] = count[j]+1;
+					}
+				}
+			}
+
+			int max_count = *max_element(count.begin(), count.end());	
+			vector<sensor_msgs::PointCloud2>::iterator it2 = clusters.begin();
+			for (vector<int>::iterator pos = count.begin(); pos != count.end(); pos++) {
+				if (*pos == max_count){
+					central_duplo2 = *it2;
+				}
+				it2++;
+			}
+		}
+
+		central_duplo2.header.frame_id = "base_link";
+		central_duplo2.header.stamp = ros::Time::now();
+		fromROSMsg(central_duplo2,central);
+
+		object_manipulation_msgs::ClusterBoundingBox bbx;
+		getClusterBoundingBox(central_duplo2, bbx.pose_stamped, bbx.dimensions);
+		//getClusterBoundingBox(target_cloud2_, bbx_.pose_stamped, bbx_.dimensions);
+		/*
+		 std::vector<geometry_msgs::Point> central_extent = find_extents(central);
+		 center.x = central_extent[0].x + (central_extent[1].x - central_extent[0].x)/2-0.01;
+		 center.y = central_extent[2].y + (central_extent[3].y - central_extent[2].y)/2;
+		 center.z = central_extent[4].z + (central_extent[5].z - central_extent[4].z)/2 + 0.018;
+		 */
+		center = bbx.pose_stamped.pose.position;
+		//center.x -= 0.01;
+		//center.y -= 0.02;
+		temp = center;
+		temp.z += bbx.dimensions.z*0.5;
+		//temp.z = table_extent_[5].z;
+		temp.z += 0.1;
+		path.push_back(temp);		//path[0]: Over the cloud
+		temp.z -= 0.1;//0.17; //0.153;
+
+		bool x_push = true;
+		if (abs(cloud_extent[1].x - center.x) > abs(cloud_extent[0].x - center.x)) {
+			//temp.x += 0.05;
+			if (cloud_extent[0].x - table_extent_[0].x > abs(cloud_extent[0].x - center.x) + 0.03) {
+				path.push_back(temp);		//path[1]:: On the cloud
+				temp.x -= abs(cloud_extent[0].x - center.x) + 0.03;
+				path.push_back(temp);		//path[2]: In X direction
+			} else if (cloud_extent[0].x - table_extent_[0].x > 0.1) {
+				path.push_back(temp);		//path[1]:: On the cloud
+				temp.x -= 0.06;
+				path.push_back(temp);		//path[2]: In X direction
+			} else x_push = false;
+		} else {
+			//temp.x -= 0.05;
+			//if (table_extent_[1].x - cloud_extent[1].x > abs(cloud_extent[1].x - center.x + 0.01)) {
+			if (0.8 - cloud_extent[1].x > abs(cloud_extent[1].x - center.x)) {
+				path.push_back(temp);		//path[1]:: On the cloud
+				temp.x += abs(cloud_extent[1].x - center.x) + 0.03;
+				path.push_back(temp);
+			} else if (0.8 - cloud_extent[1].x > 0.1) {//(table_extent_[1].x - cloud_extent[1].x > 0.1) {
+				path.push_back(temp);		//path[1]:: On the cloud
+				temp.x += 0.06;
+				path.push_back(temp);		//path[2]: In X direction
+			} else x_push = false;
+		}
+
+		//temp.x = center.x;
+		/*if (x_push) {
+			temp.z += 0.10;
+			path.push_back(temp);			//path[4]: Over the cloud
+			return path;
+		}*/
+
+		if (abs(cloud_extent[3].y - center.y) > abs(cloud_extent[2].y - center.y)) {	
+			//temp.y += 0.05;
+			if (cloud_extent[2].y - table_extent_[2].y > abs(cloud_extent[2].y - center.y) + 0.03) {
+				path.push_back(temp);		//path[1]:: On the cloud
+				temp.y -= abs(cloud_extent[2].y - center.y) + 0.03;
+				path.push_back(temp);
+			} else if (cloud_extent[2].y - table_extent_[2].y > 0.1) {
+				path.push_back(temp);		//path[1]:: On the cloud
+				temp.y -= 0.06;
+				path.push_back(temp);		//path[3]: In Y direction
+			}
+		} else {
+			//temp.y -= 0.05;
+			if (table_extent_[3].y - cloud_extent[3].y > abs(cloud_extent[3].y - center.y) + 0.03) {
+				path.push_back(temp);		//path[1]:: On the cloud
+				temp.y += abs(cloud_extent[3].y - center.y) + 0.03;
+				path.push_back(temp);
+			} else if (table_extent_[3].y - cloud_extent[3].y > 0.1) {
+				path.push_back(temp);		//path[1]:: On the cloud
+				temp.y += 0.06;
+				path.push_back(temp);		//path[3]: In Y direction
+			}
+		}
+
+		temp.z += 0.1;
+		path.push_back(temp);			//path[4]: Over the cloud
+
+		return path;
+	}
+
+	std::vector<geometry_msgs::PointStamped> Manipulator::find_waypoints(pcl::PointCloud<pcl::PointXYZRGB> pcd)
+	{
+		sensor_msgs::PointCloud2 pcd2;
+		toROSMsg(pcd, pcd2);
+
+		ROS_INFO("DUPLO: Inside Find waypoints");
+		ROS_INFO("DUPLO: Frame id: %s",pcd2.header.frame_id.c_str());
+		vector<double> vecx, vecy, vecz;
+		for (vector<PointXYZRGB, Eigen::aligned_allocator<PointXYZRGB> >::iterator it1 = pcd.points.begin(); it1 != pcd.points.end(); ++it1) {
+			vecx.push_back(it1->x);			vecy.push_back(it1->y);			vecz.push_back(it1->z);
+		}
+
+		vector<double>::iterator it_minx, it_miny, it_minz, it_maxx, it_maxy, it_maxz;
+		it_minx = min_element(vecx.begin(), vecx.end());
+		it_miny = min_element(vecy.begin(), vecy.end());
+		it_minz = min_element(vecz.begin(), vecz.end());
+		it_maxx = max_element(vecx.begin(), vecx.end());
+		it_maxy = max_element(vecy.begin(), vecy.end());
+		it_maxz = max_element(vecz.begin(), vecz.end());
+
+		//float dim1, dim2, dim3;
+		pcl::PointXYZRGB pt_minx, pt_miny, pt_minz, pt_maxx, pt_maxy, pt_maxz;
+		vector<PointXYZRGB, Eigen::aligned_allocator<PointXYZRGB> >::iterator it2 = pcd.points.begin();
+
+		for (vector<double>::iterator pos = vecx.begin(); pos != vecx.end(); ++pos) {
+			if (pos == it_minx)				pt_minx = *it2;
+			if (pos == it_maxx)				pt_maxx = *it2;
+			++it2;
+		}
+
+		it2 = pcd.points.begin();
+		for (vector<double>::iterator pos = vecy.begin(); pos != vecy.end(); ++pos) {
+			if (pos == it_miny)				pt_miny = *it2;
+			if (pos == it_maxy)				pt_maxy = *it2;
+			++it2;
+		}
+
+		it2 = pcd.points.begin();
+		for (vector<double>::iterator pos = vecz.begin(); pos != vecz.end(); ++pos) {
+			if (pos == it_minz)				pt_minz = *it2;
+			if (pos == it_maxz)				pt_maxz = *it2;
+			++it2;
+		}
+
+		geometry_msgs::Point xmin,xmax,ymin,ymax,zmin,zmax;
+		xmin.x = pt_minx.x;		xmin.y = pt_minx.y;		xmin.z = pt_minx.z;
+		xmax.x = pt_maxx.x;		xmax.y = pt_maxx.y;		xmax.z = pt_maxx.z;
+		ymin.x = pt_miny.x;		ymin.y = pt_miny.y;		ymin.z = pt_miny.z;
+		ymax.x = pt_maxy.x;		ymax.y = pt_maxy.y;		ymax.z = pt_maxy.z;
+		zmin.x = pt_minz.x;		zmin.y = pt_minz.y;		zmin.z = pt_minz.z;
+		zmax.x = pt_maxz.x;		zmax.y = pt_maxz.y;		zmax.z = pt_maxz.z;
+
+		marker_pub_.publish(set_marker("base_link","extents",0,shape[1],xmin,0.02,0.0f,0.0f,1.0f,1.0));
+		marker_pub_.publish(set_marker("base_link","extents",1,shape[1],xmax,0.02,0.0f,0.0f,1.0f,1.0));
+		marker_pub_.publish(set_marker("base_link","extents",2,shape[1],ymin,0.02,0.0f,0.0f,1.0f,1.0));
+		marker_pub_.publish(set_marker("base_link","extents",3,shape[1],ymax,0.02,0.0f,0.0f,1.0f,1.0));
+		marker_pub_.publish(set_marker("base_link","extents",4,shape[1],zmin,0.02,0.0f,0.0f,1.0f,1.0));
+		marker_pub_.publish(set_marker("base_link","extents",5,shape[1],zmax,0.02,0.0f,0.0f,1.0f,1.0));
+
+		geometry_msgs::PointStamped wp[13];
+
+		wp[1].point.x = pt_maxz.x-0.01;
+		wp[1].point.y = pt_maxz.y-0.01;
+		wp[1].point.z = pt_maxz.z;//+0.01;
+		for (int i = 0; i < 12; i++)
+			wp[i] = wp[1];
+
+		wp[0].point.x += 0.07;
+		wp[2].point.x -= 0.07;
+		wp[3].point.y += 0.07;
+		wp[5].point.y -= 0.07;
+		wp[6].point.y += 0.07;
+		wp[8].point.y -= 0.07;
+		wp[9].point.x += 0.07;
+		wp[11].point.x -= 0.07;
+		wp[12].point.z += 0.1;
+
+		std::vector<geometry_msgs::PointStamped> waypoints;
+		for (int i = 0; i < 13; i++) {
+			wp[i].header.stamp = ros::Time();
+			wp[i].header.frame_id = "base_link";
+			waypoints.push_back(wp[i]);
+		}
+
+		/*	if (abs(pt_maxz.y - pt_maxy.y) - abs(pt_maxz.y - pt_miny.y) <= 0.02) {
+				wp[0].point.y = wp[1].point.y - 0.05;
+				wp[2].point.y = wp[1].point.y + 0.05;
+		} else {
+			wp[0].point.y = wp[1].point.y + 0.05;
+			wp[2].point.y = wp[1].point.y - 0.05;
+		}
+
+		wp[0].point.z = wp[1].point.z;
+		wp[2].point.x = wp[1].point.x;
+		wp[2].point.y = wp[1].point.y + 0.1;
+		wp[2].point.z = wp[1].point.z;
+
+		wp[0].point.x = pt_miny.x;
+		wp[0].point.y = pt_miny.y;
+		wp[0].point.z = pt_maxz.z;
+		//	wp[0].point.z = pt_minz.z + (pt_maxz.z - pt_minz.z)/2;
+
+		//	wp[1].point.z = pt_minz.z + (pt_maxz.z - pt_minz.z)/2;
+		//	wp[1].z = pt_minz.rgb;
+		wp[2].point.x = pt_maxy.x;
+		wp[2].point.y = pt_maxy.y;
+		wp[2].point.z = pt_maxz.z;
+		//	wp[2].point.z = pt_minz.z + (pt_maxz.z - pt_minz.z)/2;
+		 */
+
+		/*	geometry_msgs::Point minx, miny, maxx, maxy, minz, maxz;
+			 minx = wp[0].point.
+				 marker_pub.publish(set_marker("openni_rgb_optical_frame","keypoints",0,shape[0],point,
+				 0.02,0.0f,0.0f,1.0f,0.5));
+		 */
+		//	ROS_INFO("DUPLO: Waypoint: %f, %f, %f", wp[1].point.x, wp[1].point.y, wp[1].point.z);
+
+		for (int i = 0; i < 3; i++) {
+			// Publish the waypoints markers
+			marker_pub_.publish(set_marker("base_link","waypoints",i,shape[i],wp[i].point,
+					0.02,0.0f,1.0f,0.0f,1.0));
+		}
+
+		ROS_INFO("DUPLO: Exiting Finding waypoints");
+		return waypoints;
+	}
+	
+	float Manipulator::findLongestDim(pcl::PointCloud<pcl::PointXYZRGB> pcd)
+	{ 
+		vector<double> vecx, vecy, vecz;
+		for (vector<PointXYZRGB, Eigen::aligned_allocator<PointXYZRGB> >::iterator it1 = pcd.points.begin(); it1 != pcd.points.end(); ++it1) {
+			vecx.push_back(it1->x);
+			vecy.push_back(it1->y);
+			vecz.push_back(it1->z);
+		}
+		
+		vector<double>::iterator it_minx, it_miny, it_minz, it_maxx, it_maxy, it_maxz;
+		it_minx = min_element(vecx.begin(), vecx.end());
+		it_miny = min_element(vecy.begin(), vecy.end());
+		it_minz = min_element(vecz.begin(), vecz.end());
+		it_maxx = max_element(vecx.begin(), vecx.end());
+		it_maxy = max_element(vecy.begin(), vecy.end());
+		it_maxz = max_element(vecz.begin(), vecz.end());
+		
+		float dim1, dim2, dim3;
+		pcl::PointXYZRGB pt_minx, pt_miny, pt_minz, pt_maxx, pt_maxy, pt_maxz;
+		vector<PointXYZRGB, Eigen::aligned_allocator<PointXYZRGB> >::iterator it2 = pcd.points.begin();
+		
+		for (vector<double>::iterator pos = vecx.begin(); pos != vecx.end(); ++pos) {
+			if (pos == it_minx)				pt_minx = *it2;
+			if (pos == it_maxx)				pt_maxx = *it2;
+			++it2;
+		}
+		
+		it2 = pcd.points.begin();
+		for (vector<double>::iterator pos = vecy.begin(); pos != vecy.end(); ++pos) {
+			if (pos == it_miny)				pt_miny = *it2;
+			if (pos == it_maxy)				pt_maxy = *it2;
+			++it2;
+		}
+		
+		it2 = pcd.points.begin();
+		for (vector<double>::iterator pos = vecz.begin(); pos != vecz.end(); ++pos) {
+			if (pos == it_minz)				pt_minz = *it2;
+			if (pos == it_maxz)				pt_maxz = *it2;
+			++it2;
+		}
+		
+		dim1 = pow((pt_maxx.x - pt_minx.x),2) + pow((pt_maxx.y - pt_minx.y),2) + 
+		pow((pt_maxx.z - pt_minx.z),2);
+		dim2 = pow((pt_maxy.x - pt_miny.x),2) + pow((pt_maxy.y - pt_miny.y),2) + 
+		pow((pt_maxy.z - pt_miny.z),2);
+		dim3 = pow((pt_maxz.x - pt_minz.x),2) + pow((pt_maxz.y - pt_minz.y),2) + 
+		pow((pt_maxz.z - pt_minz.z),2);
+		
+		float max_dim = std::max(dim1, dim2);
+		max_dim = std::max(max_dim,dim3);
+		return (sqrt(max_dim));
+	}	
+
+	void Manipulator::resetCollisionModels() {
+		arm_navigation_msgs::CollisionObject reset_object;
+		reset_object.operation.operation = arm_navigation_msgs::CollisionObjectOperation::REMOVE;
+		reset_object.header.frame_id = "base_link";
+		reset_object.header.stamp = ros::Time::now();
+		reset_object.id = "all";
+		collision_object_pub_.publish(reset_object);
+		//collision_object_current_id_ = 0;
+	}
+
+	void Manipulator::getClusterBoundingBox(const sensor_msgs::PointCloud2 &cluster,
+			geometry_msgs::PoseStamped &pose_stamped,
+			geometry_msgs::Vector3 &dimensions) {
+				
+		object_manipulation_msgs::FindClusterBoundingBox2 srv;
+		srv.request.cluster = cluster;
+		if (!bbx_client_.call(srv.request, srv.response)) {
+			ROS_ERROR("Failed to call cluster bounding box client");
+			//throw CollisionMapException("Failed to call cluster bounding box client");
+		}
+		pose_stamped = srv.response.pose;
+		dimensions = srv.response.box_dims;
+		if (dimensions.x == 0.0 && dimensions.y == 0.0 && dimensions.z == 0.0) {
+			ROS_ERROR("Cluster bounding box client returned an error (0.0 bounding box)");
+			//throw CollisionMapException("Bounding box computation failed");
+		}/*
+			pcl::PointCloud<PointXYZRGB>::Ptr objectCloud(new pcl::PointCloud<PointXYZRGB>);
+			fromROSMsg(cluster, *objectCloud);
+			tf::Vector3 min, max;
+			minmax3d(min, max, objectCloud);
+			bbx_.pose_stamped.pose.position = find_centroid(*objectCloud);
+			bbx_.dimensions.x = max.getX() - min.getX();
+			bbx_.dimensions.y = max.getY() - min.getY();
+			bbx_.dimensions.z = max.getZ() - min.getZ();
+			*/
+	}
+
+	void Manipulator::processCollisionGeometryForBoundingBox(const object_manipulation_msgs::ClusterBoundingBox &box,
+			std::string &collision_name) {
+		ROS_INFO("Adding bounding box with dimensions %f %f %f to collision map",
+				box.dimensions.x, box.dimensions.y, box.dimensions.z);
+
+		arm_navigation_msgs::CollisionObject collision_object;
+		collision_object.operation.operation = arm_navigation_msgs::CollisionObjectOperation::ADD;
+
+		//collision_name = getNextObjectName();
+		collision_name = "object_0";
+		collision_object.id = collision_name;
+		//target_collision_name_ = collision_name;
+
+		collision_object.header.frame_id = box.pose_stamped.header.frame_id;
+		collision_object.header.stamp = ros::Time::now();
+
+		arm_navigation_msgs::Shape shape;
+		shape.type = arm_navigation_msgs::Shape::BOX;
+		shape.dimensions.resize(3);
+		shape.dimensions[0] = box.dimensions.x;
+		shape.dimensions[1] = box.dimensions.y;
+		shape.dimensions[2] = box.dimensions.z;
+		collision_object.shapes.push_back(shape);
+		collision_object.poses.push_back(box.pose_stamped.pose);
+
+		collision_object_pub_.publish(collision_object);
+	}
+
+	void Manipulator::collision_op(std::string object1, std::string object2, int operation, double penetration,
+			arm_navigation_msgs::CollisionOperation& cop)
+	{
+		if (strcmp(object1.c_str(), "all") == 0)
+			cop.object1 = cop.COLLISION_SET_ALL;
+		else
+			cop.object1 = object1;
+		if (strcmp(object2.c_str(), "all") == 0)
+			cop.object2 = cop.COLLISION_SET_ALL;
+		else
+			cop.object2 = object2;
+
+		if (!operation)
+			cop.operation = cop.DISABLE;    //0 = Disable, 1 = Enable
+		else
+			cop.operation = cop.ENABLE;
+		cop.penetration_distance = penetration;
+	}
+	
+	void Manipulator::add_collision_object(arm_navigation_msgs::CollisionObject& cob, int operation, int primitive)
+	{
+		cob.id = collision_name_;
+		if (operation == 0)
+			cob.operation.operation = arm_navigation_msgs::CollisionObjectOperation::ADD; //0: add, 1: remove, 2: detach and add; 3: attach and remove
+		else if (operation == 1)
+				cob.operation.operation = arm_navigation_msgs::CollisionObjectOperation::REMOVE;
+		else if (operation == 2)
+				cob.operation.operation = arm_navigation_msgs::CollisionObjectOperation::DETACH_AND_ADD_AS_OBJECT;
+		else if (operation == 3)
+			cob.operation.operation = arm_navigation_msgs::CollisionObjectOperation::ATTACH_AND_REMOVE_AS_OBJECT;
+		 //0: add, 1: remove, 2: detach and add; 3: attach and remove
+		cob.header.frame_id = "base_link";
+		cob.header.stamp = ros::Time::now();
+		arm_navigation_msgs::Shape object;
+		object.type = arm_navigation_msgs::Shape::BOX;  //0: sphere; 1: box; 2: cylinder; 3: mesh
+		object.dimensions.resize(3);
+		if (primitive == 0) {
+			object.dimensions[0] = bbx_.dimensions.x + 0.1;//0.04;
+			object.dimensions[1] = bbx_.dimensions.y + 0.1;//0.04;
+		} else {
+			object.dimensions[0] = bbx_.dimensions.x + 0.1;
+			object.dimensions[1] = bbx_.dimensions.y + 0.1;
+		}
+		object.dimensions[2] = bbx_.dimensions.z + 0.04;
+		cob.shapes.push_back(object);
+
+		cob.poses.push_back(bbx_.pose_stamped.pose);
+	}
+
+	int Manipulator::move_arm(geometry_msgs::Point go_to, int cluster_id, int collision_object_operation, int plan_id, int action)
+	{
+		actionlib::SimpleActionClient<arm_navigation_msgs::MoveArmAction> move_arm("move_right_arm",true);
+		move_arm.waitForServer();
+		ROS_INFO("DUPLO: Connected to server");
+		
+		ROS_INFO("Creating move arm goal");
+		arm_navigation_msgs::MoveArmGoal goalA;
+		goalA.motion_plan_request.group_name = "right_arm";
+		goalA.motion_plan_request.num_planning_attempts = 3;
+		goalA.motion_plan_request.planner_id = std::string("");
+		goalA.planner_service_name = std::string("ompl_planning/plan_kinematic_path");
+		goalA.motion_plan_request.allowed_planning_time = ros::Duration(5.0);
+		
+		if (cluster_id != 100) {
+			arm_navigation_msgs::CollisionObject cob;
+			add_collision_object(cob, collision_object_operation, action);
+			goalA.planning_scene_diff.collision_objects.push_back(cob);
+
+			arm_navigation_msgs::CollisionOperation cop;
+			if (action == 0 && plan_id == 1)
+				collision_op("r_end_effector", collision_name_, collision_object_operation, 0.5, cop);
+			else if (action == 0 && plan_id == 2)
+				collision_op("all", "all", collision_object_operation, 0.5, cop);
+			else
+				//collision_op("r_end_effector", collision_name_, collision_object_operation, 0.5, cop);
+				collision_op("all", "all", collision_object_operation, 0.5, cop);
+			goalA.operations.collision_operations.push_back(cop);
+		}
+
+		//ros::Duration(2.0).sleep();
+		
+		arm_navigation_msgs::SimplePoseConstraint desired_pose;
+		desired_pose.header.frame_id = "base_link";
+		desired_pose.header.stamp = ros::Time::now();
+		desired_pose.link_name = "r_wrist_roll_link";
+		desired_pose.pose.position = go_to;
+		if (action == 1 && plan_id == 1) {
+			desired_pose.pose.position.z = go_to.z + 0.188; //0.188; //0.19;
+			desired_pose.pose.position.x -= 0.01;	//0.01;
+			desired_pose.pose.position.y -= 0.01;	//0.01;
+		} else if (action == 1 && plan_id == 2)
+			desired_pose.pose.position.x = go_to.x - 0.08;
+		else if (action == 2 && plan_id < 3) {
+			desired_pose.pose.position.z = go_to.z+0.188;
+			desired_pose.pose.position.x -= 0.01;	//0.01;
+			desired_pose.pose.position.y -= 0.01;	//0.01;
+		} else if (action == 2 && plan_id >= 3)
+			desired_pose.pose.position.x = go_to.x - 0.08;
+		else if (action == 0)
+		{
+			desired_pose.pose.position.x -= 0.01;
+			desired_pose.pose.position.y -= 0.02;	//0.01;
+			desired_pose.pose.position.z += 0.155;
+		}
+		
+		desired_pose.pose.orientation.x = 0.0;
+		desired_pose.pose.orientation.y = 0.0;
+		desired_pose.pose.orientation.z = 0.0;
+		desired_pose.pose.orientation.w = 1.0;
+		if ((action == 1 && plan_id == 1) || (action == 2 && plan_id < 2)) {
+			desired_pose.pose.orientation.x = -0.74;//-0.06; //
+			desired_pose.pose.orientation.y = -0.04; //0.72;	//
+			desired_pose.pose.orientation.z = 0.67; //0.007;	//
+			desired_pose.pose.orientation.w = -0.04; //0.68;	//
+		} else if (action == 0) {
+			// specify rotation in rpy or other methods (euler)
+			tf::Transform t1, t2, t3;
+			tf::Quaternion q1, q3, q4;
+			tf::Matrix3x3 rot_matrix1, rot_matrix2;
+
+			tf::Quaternion q2(bbx_.pose_stamped.pose.orientation.x,
+					bbx_.pose_stamped.pose.orientation.y,
+					bbx_.pose_stamped.pose.orientation.z,
+					bbx_.pose_stamped.pose.orientation.w);
+			t2.setRotation(q2);
+			t2.setOrigin(tf::Vector3(0.0, 0.0, 0.0));
+			double roll, pitch, yaw;
+			t2.getBasis().getRPY(roll, pitch, yaw);
+			ROS_INFO("bbx_pose RPY = %f %f %f", roll, pitch, yaw);
+
+			rot_matrix1.setRPY(0.0, 1.57, yaw);
+			rot_matrix1.getRotation(q4);
+/*
+			rot_matrix2.setRPY(0.0, 0.0, yaw);
+			rot_matrix2.getRotation(q3);
+			t3.setRotation(q3);
+			t3.setOrigin(tf::Vector3(0.0, 0.0, 0.0));
+
+			q4 = t3*q1;
+			//breakpoint();
+			geometry_msgs::PoseStamped ps = bbx_.pose_stamped;
+			ps.pose.orientation.x = q1.getX();
+			ps.pose.orientation.y = q1.getY();
+			ps.pose.orientation.z = q1.getZ();
+			ps.pose.orientation.w = q1.getW();
+			bbx_pose_pub_.publish(ps);
+			//breakpoint();
+			ps.pose.orientation.x = q3.getX();
+			ps.pose.orientation.y = q3.getY();
+			ps.pose.orientation.z = q3.getZ();
+			ps.pose.orientation.w = q3.getW();
+			bbx_pose_pub_.publish(ps);
+			//breakpoint();
+			ps.pose.orientation.x = q4.getX();
+			ps.pose.orientation.y = q4.getY();
+			ps.pose.orientation.z = q4.getZ();
+			ps.pose.orientation.w = q4.getW();
+			bbx_pose_pub_.publish(ps);
+*/
+			desired_pose.pose.orientation.x = q4.getX();
+			desired_pose.pose.orientation.y = q4.getY();
+			desired_pose.pose.orientation.z = q4.getZ();
+			desired_pose.pose.orientation.w = q4.getW();
+		}
+		
+		desired_pose.absolute_position_tolerance.x = 0.01;	//0.01
+		desired_pose.absolute_position_tolerance.y = 0.01;	//0.01
+		desired_pose.absolute_position_tolerance.z = 0.04;  //0.02
+		
+		desired_pose.absolute_roll_tolerance = 2.0; //0.04;
+		desired_pose.absolute_pitch_tolerance = 2.0; //0.04;
+		desired_pose.absolute_yaw_tolerance = 2.0; //0.04;
+		
+		arm_navigation_msgs::addGoalConstraintToMoveArmGoal(desired_pose,goalA);
+		
+		bool finished_within_time = false;
+		
+		ROS_INFO("Sending goal to move arm");
+		//breakpoint();
+
+		move_arm.sendGoal(goalA);
+		finished_within_time = move_arm.waitForResult(ros::Duration(10.0));
+		if (!finished_within_time) {
+			move_arm.cancelGoal();
+			ROS_INFO("DUPLO: Timed out achieving goal A");
+			return -1;
+		} else {
+			actionlib::SimpleClientGoalState state = move_arm.getState();
+			//bool success = (state == actionlib::SimpleClientGoalState::SUCCEEDED);
+			if(state == actionlib::SimpleClientGoalState::SUCCEEDED) {
+				ROS_INFO("DUPLO: Action finished: %s",state.toString().c_str());
+				return 0;
+			} else if (state == actionlib::SimpleClientGoalState::ABORTED) {
+				ROS_ERROR("DUPLO: Action failed: %s",state.toString().c_str());
+				return -1;
+			} else {
+				ROS_ERROR("DUPLO: Action state: %s",state.toString().c_str());
+				return 0;
+			}
+		}
+		return 0;
+	}
+
+	void Manipulator::breakpoint()
+	{
+		int user_input;
+		std::cout << "Save the screen shot if needed. Press 1 and then 'Enter' after you are done." << std::endl;
+		std::cin >> user_input;
+	}
+
+}
+
+int main(int argc, char **argv)
+{
+	/*if (argc != 2) {
+		ROS_ERROR("Insufficient number of arguments. Give 0 for sorting by color and 1 for sorting by size.");
+		return -1;
+	}*/
+	
+	//initialize the ROS node
+	ros::init(argc, argv, "manipulator");
+	ros::NodeHandle n;
+	//sort_duplos::Manipulator m(n, atoi(argv[1]));
+	sort_duplos::Manipulator m(n, 0);
+
+	ROS_INFO("DUPLO: Entered manipulator");
+	ros::spin();
+	return 0;
+}
