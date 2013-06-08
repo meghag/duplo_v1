@@ -831,10 +831,20 @@ namespace sort_duplos
 		desired_pose.pose.orientation.z = 0.0;
 		desired_pose.pose.orientation.w = 1.0;
 		if ((action == 1 && plan_id == 1) || (action == 2 && plan_id < 2)) {
-			desired_pose.pose.orientation.x = -0.74;//-0.06; //
+			tf::Quaternion q4;
+			tf::Matrix3x3 rot_matrix1;
+			rot_matrix1.setRPY(0.0, 1.57, 0.0);
+			rot_matrix1.getRotation(q4);
+			desired_pose.pose.orientation.x = q4.getX();
+			desired_pose.pose.orientation.y = q4.getY();
+			desired_pose.pose.orientation.z = q4.getZ();
+			desired_pose.pose.orientation.w = q4.getW();
+
+			/*desired_pose.pose.orientation.x = -0.74;//-0.06; //
 			desired_pose.pose.orientation.y = -0.04; //0.72;	//
 			desired_pose.pose.orientation.z = 0.67; //0.007;	//
 			desired_pose.pose.orientation.w = -0.04; //0.68;	//
+			*/
 		} else if (action == 0) {
 			// specify rotation in rpy or other methods (euler)
 			tf::Transform t1, t2, t3;

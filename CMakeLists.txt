@@ -38,6 +38,7 @@ src/set_boundaries.cpp src/move_arm.cpp src/cluster.cpp src/robot_head.cpp src/i
 
 rosbuild_add_executable(read_pcd src/pcd_from_kinect.cpp)
 #rosbuild_add_executable(tumble_kinect src/tumble_kinect.cpp)
+target_link_libraries(read_pcd boost_signals)
 
 rosbuild_add_executable(process_pcd src/process_pcd.cpp)
 target_link_libraries(process_pcd ${PROJECT_NAME})
