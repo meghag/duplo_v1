@@ -45,6 +45,7 @@
 #include "cluster.h"
 #include "find_extents.h"
 #include "set_marker.h"
+#include "pass_through_gen.h"
 
 using namespace std;
 
@@ -71,6 +72,9 @@ namespace sort_duplos {
 			bool tumble();
 
 			std::vector<geometry_msgs::Point> find_spread_path(pcl::PointCloud<pcl::PointXYZRGB> pcd);
+			sensor_msgs::PointCloud2 find_central_cluster(vector<sensor_msgs::PointCloud2> clusters);
+			std::vector<geometry_msgs::Point> find_spread_path_large(pcl::PointCloud<pcl::PointXYZRGB>::Ptr pcd[]);
+
 			std::vector<geometry_msgs::PointStamped> find_waypoints(pcl::PointCloud<pcl::PointXYZRGB> pcd);
 			geometry_msgs::Point findPlaceLocation();
 			float findLongestDim(pcl::PointCloud<pcl::PointXYZRGB> pcd);

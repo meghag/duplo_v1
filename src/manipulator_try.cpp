@@ -36,7 +36,7 @@ namespace sort_duplos
 		//BLUE.x = 0.5;  BLUE.y = -0.5; BLUE.z = 1.0;	//Blue bin
 		//GREEN.x = 0.6; GREEN.y = -0.5; GREEN.z = 1.0;  //Green bin
 
-		RED.x = 0.5;  RED.y = -0.5; RED.z = 1.0;  //Red bin
+		RED.x = 0.5;  RED.y = -0.49; RED.z = 1.0;  //Red bin
 		BLUE.x = 0.5;  BLUE.y = -0.6; BLUE.z = 1.0;	//Blue bin
 		GREEN.x = 0.5; GREEN.y = -0.7; GREEN.z = 1.0;  //Green bin
 
@@ -180,7 +180,34 @@ namespace sort_duplos
 		ROS_INFO("DUPLO: Finding central cluster");
 		pcl::PointCloud<pcl::PointXYZRGB> pcd;
 		fromROSMsg(target_cloud2_,pcd);
-		spread_path_ = find_spread_path(pcd);
+
+		std::vector<geometry_msgs::Point> cloud_extent = find_extents(pcd);
+		PointCloud<PointXYZRGB>::Ptr pcd_ptr(new PointCloud<PointXYZRGB>);
+		*pcd_ptr = pcd;
+		vector<sensor_msgs::PointCloud2> clusters = cluster_regions(pcd_ptr,0);
+		bool is_cluster_large = false;
+
+		if (clusters.size() > 10) {
+			//Too many duplos in the region. Divide into 4 regions.
+			is_cluster_large = true;
+			double xmin = cloud_extent[0].x;	double xmax = cloud_extent[1].x;
+			double ymin = cloud_extent[2].y;	double ymax = cloud_extent[3].y;
+			pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud1(new pcl::PointCloud<pcl::PointXYZRGB>),
+					cloud2(new pcl::PointCloud<pcl::PointXYZRGB>),
+					cloud3(new pcl::PointCloud<pcl::PointXYZRGB>),
+					cloud4(new pcl::PointCloud<pcl::PointXYZRGB>);	//Filtered cloud
+			pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud[4];
+
+			pass_through_gen(pcd_ptr,cloud1,true,xmin,xmin + 0.5*(xmax-xmin),true,ymin,ymin + 0.5*(ymax-ymin),true,0,1.0);
+			pass_through_gen(pcd_ptr,cloud2,true,xmin + 0.5*(xmax-xmin),xmax, true,ymin,ymin + 0.5*(ymax-ymin),true,0,1.0);
+			pass_through_gen(pcd_ptr,cloud3,true,xmin + 0.5*(xmax-xmin),xmax, true,ymin + 0.5*(ymax-ymin),ymax, true,0,1.0);
+			pass_through_gen(pcd_ptr,cloud4,true,xmin,xmin + 0.5*(xmax-xmin),true,ymin + 0.5*(ymax-ymin),ymax, true,0,1.0);
+			cloud[0] = cloud1; cloud[1] = cloud2; cloud[2] = cloud3; cloud[3] = cloud4;
+
+			spread_path_ = find_spread_path_large(cloud);
+		} else {
+			spread_path_ = find_spread_path(pcd);
+		}
 
 		// Publish the central markers
 		for (size_t i = 0; i < spread_path_.size(); i++)
@@ -231,8 +258,8 @@ namespace sort_duplos
 		//breakpoint();
 
 		manipulate_service_called_ = true;
+
 		if (move_count > 2)
-//		if (move_count == 2)
 			return true;
 		else 
 			return false;
@@ -353,41 +380,32 @@ namespace sort_duplos
 		sensor_msgs::PointCloud2 central_duplo2;
 		PointCloud<PointXYZRGB> central;
 
-		if (clusters.size() > 15) {
-			//Too many duplos in the region. Just go to the center and spread.
-			//center.x = cloud_extent[0].x + (cloud_extent[1].x - cloud_extent[0].x)*0.5;
-			//center.y = cloud_extent[2].y + (cloud_extent[3].y - cloud_extent[2].y)*0.5;
-			//center.z = cloud_extent[4].z + 0.01;	//(cloud_extent[5].z - cloud_extent[4].z)*0.5;
-			//temp = center;
-			central_duplo2 = clusters[9];
-		} else {
-			vector<int> count;
-			for (size_t i = 0; i < clusters.size(); i++)
-				count.push_back(0);
+		vector<int> count;
+		for (size_t i = 0; i < clusters.size(); i++)
+			count.push_back(0);
 
-			for (size_t i = 0; i < clusters.size()-1; i++) {
-				for (size_t j = i+1; j < clusters.size(); j++) {
-					//ROS_INFO("DUPLO: Inside in contact for loop region %d",region_id);
-					pcl::PointCloud<PointXYZRGB> temp1, temp2;
-					fromROSMsg(clusters[i], temp1);
-					fromROSMsg(clusters[j], temp2);
+		for (size_t i = 0; i < clusters.size()-1; i++) {
+			for (size_t j = i+1; j < clusters.size(); j++) {
+				//ROS_INFO("DUPLO: Inside in contact for loop region %d",region_id);
+				pcl::PointCloud<PointXYZRGB> temp1, temp2;
+				fromROSMsg(clusters[i], temp1);
+				fromROSMsg(clusters[j], temp2);
 
-					if (incontact(temp1, temp2)) {
-						//The two clusters are closer than 1.5 cm
-						count[i] = count[i]+1;
-						count[j] = count[j]+1;
-					}
+				if (incontact(temp1, temp2)) {
+					//The two clusters are closer than 1.5 cm
+					count[i] = count[i]+1;
+					count[j] = count[j]+1;
 				}
 			}
+		}
 
-			int max_count = *max_element(count.begin(), count.end());	
-			vector<sensor_msgs::PointCloud2>::iterator it2 = clusters.begin();
-			for (vector<int>::iterator pos = count.begin(); pos != count.end(); pos++) {
-				if (*pos == max_count){
-					central_duplo2 = *it2;
-				}
-				it2++;
+		int max_count = *max_element(count.begin(), count.end());
+		vector<sensor_msgs::PointCloud2>::iterator it2 = clusters.begin();
+		for (vector<int>::iterator pos = count.begin(); pos != count.end(); pos++) {
+			if (*pos == max_count){
+				central_duplo2 = *it2;
 			}
+			it2++;
 		}
 
 		central_duplo2.header.frame_id = "base_link";
@@ -404,7 +422,7 @@ namespace sort_duplos
 		 center.z = central_extent[4].z + (central_extent[5].z - central_extent[4].z)/2 + 0.018;
 		 */
 		center = bbx.pose_stamped.pose.position;
-		//center.x -= 0.01;
+		center.x += 0.01;
 		//center.y -= 0.02;
 		temp = center;
 		temp.z += bbx.dimensions.z*0.5;
@@ -412,31 +430,29 @@ namespace sort_duplos
 		temp.z += 0.1;
 		path.push_back(temp);		//path[0]: Over the cloud
 		temp.z -= 0.1;//0.17; //0.153;
+		path.push_back(temp);		//path[1]:: On the cloud
+		//temp.z += 0.01;
 
-		bool x_push = true;
+		//bool x_push = true;
 		if (abs(cloud_extent[1].x - center.x) > abs(cloud_extent[0].x - center.x)) {
 			//temp.x += 0.05;
 			if (cloud_extent[0].x - table_extent_[0].x > abs(cloud_extent[0].x - center.x) + 0.03) {
-				path.push_back(temp);		//path[1]:: On the cloud
 				temp.x -= abs(cloud_extent[0].x - center.x) + 0.03;
 				path.push_back(temp);		//path[2]: In X direction
 			} else if (cloud_extent[0].x - table_extent_[0].x > 0.1) {
-				path.push_back(temp);		//path[1]:: On the cloud
 				temp.x -= 0.06;
 				path.push_back(temp);		//path[2]: In X direction
-			} else x_push = false;
+			} //else x_push = false;
 		} else {
 			//temp.x -= 0.05;
 			//if (table_extent_[1].x - cloud_extent[1].x > abs(cloud_extent[1].x - center.x + 0.01)) {
 			if (0.8 - cloud_extent[1].x > abs(cloud_extent[1].x - center.x)) {
-				path.push_back(temp);		//path[1]:: On the cloud
 				temp.x += abs(cloud_extent[1].x - center.x) + 0.03;
 				path.push_back(temp);
 			} else if (0.8 - cloud_extent[1].x > 0.1) {//(table_extent_[1].x - cloud_extent[1].x > 0.1) {
-				path.push_back(temp);		//path[1]:: On the cloud
 				temp.x += 0.06;
 				path.push_back(temp);		//path[2]: In X direction
-			} else x_push = false;
+			} //else x_push = false;
 		}
 
 		//temp.x = center.x;
@@ -460,16 +476,156 @@ namespace sort_duplos
 		} else {
 			//temp.y -= 0.05;
 			if (table_extent_[3].y - cloud_extent[3].y > abs(cloud_extent[3].y - center.y) + 0.03) {
-				path.push_back(temp);		//path[1]:: On the cloud
 				temp.y += abs(cloud_extent[3].y - center.y) + 0.03;
 				path.push_back(temp);
 			} else if (table_extent_[3].y - cloud_extent[3].y > 0.1) {
-				path.push_back(temp);		//path[1]:: On the cloud
 				temp.y += 0.06;
 				path.push_back(temp);		//path[3]: In Y direction
 			}
 		}
 
+		temp.z += 0.1;
+		path.push_back(temp);			//path[4]: Over the cloud
+
+		return path;
+	}
+
+	sensor_msgs::PointCloud2 Manipulator::find_central_cluster(vector<sensor_msgs::PointCloud2> clusters)
+	{
+		vector<int> count;
+		sensor_msgs::PointCloud2 central_duplo2;
+
+		for (size_t i = 0; i < clusters.size(); i++)
+			count.push_back(0);
+
+		for (size_t i = 0; i < clusters.size()-1; i++) {
+			for (size_t j = i+1; j < clusters.size(); j++) {
+				//ROS_INFO("DUPLO: Inside in contact for loop region %d",region_id);
+				pcl::PointCloud<PointXYZRGB> temp1, temp2;
+				fromROSMsg(clusters[i], temp1);
+				fromROSMsg(clusters[j], temp2);
+
+				if (incontact(temp1, temp2)) {
+					//The two clusters are closer than 1.5 cm
+					count[i] = count[i]+1;
+					count[j] = count[j]+1;
+				}
+			}
+		}
+
+		int max_count = *max_element(count.begin(), count.end());
+		vector<sensor_msgs::PointCloud2>::iterator it2 = clusters.begin();
+		for (vector<int>::iterator pos = count.begin(); pos != count.end(); pos++) {
+			if (*pos == max_count){
+				central_duplo2 = *it2;
+			}
+			it2++;
+		}
+
+		central_duplo2.header.frame_id = "base_link";
+		central_duplo2.header.stamp = ros::Time::now();
+		return central_duplo2;
+	}
+
+	std::vector<geometry_msgs::Point> Manipulator::find_spread_path_large(pcl::PointCloud<pcl::PointXYZRGB>::Ptr pcd[])
+	{
+		//TODO: Find bbx of the spread cloud and calculate spread directions based on that.
+
+		sensor_msgs::PointCloud2 pcd2;
+		//toROSMsg(pcd, pcd2);
+		ROS_INFO("DUPLO: Inside Find path large");
+		vector<geometry_msgs::Point> path;
+		geometry_msgs::Point center, temp;
+		sensor_msgs::PointCloud2 central_duplo2;
+		PointCloud<PointXYZRGB> central;
+
+		for (int i = 0; i < 4; i++) {
+			vector<sensor_msgs::PointCloud2> clusters = cluster_regions(pcd[i],0);
+
+			if (clusters.size() < 2)
+				continue;
+
+			central_duplo2 = find_central_cluster(clusters);
+			central_duplo2.header.frame_id = "base_link";
+			central_duplo2.header.stamp = ros::Time::now();
+			fromROSMsg(central_duplo2,central);
+
+			object_manipulation_msgs::ClusterBoundingBox bbx;
+			getClusterBoundingBox(central_duplo2, bbx.pose_stamped, bbx.dimensions);
+			visualization_msgs::Marker bbx_marker = set_marker("base_link", "bbx", 1, visualization_msgs::Marker::CUBE,
+							bbx.pose_stamped.pose, bbx.dimensions, 1.0f, 1.0f, 0.0f, 1.0);
+			bbx_pub_.publish(bbx_marker);
+
+			/*
+			 std::vector<geometry_msgs::Point> central_extent = find_extents(central);
+			 center.x = central_extent[0].x + (central_extent[1].x - central_extent[0].x)/2-0.01;
+			 center.y = central_extent[2].y + (central_extent[3].y - central_extent[2].y)/2;
+			 center.z = central_extent[4].z + (central_extent[5].z - central_extent[4].z)/2 + 0.018;
+			 */
+			center = bbx.pose_stamped.pose.position;
+			//center.x -= 0.01;
+			//center.y -= 0.02;
+			temp = center;
+			temp.z += bbx.dimensions.z*0.5;
+			//temp.z = table_extent_[5].z;
+			temp.z += 0.1;
+			path.push_back(temp);		//path[0]: Over the cloud
+			//temp.z -= 0.1;//0.17; //0.153;
+			temp.z -= 0.1;//0.17; //0.153;
+			path.push_back(temp);		//path[1]:: On the cloud
+			//temp.z += 0.01;
+
+			std::vector<geometry_msgs::Point> cloud_extent = find_extents(*pcd[i]);
+			if (i == 0 || i == 3) {
+				//Bottom 2 regions
+				if (cloud_extent[0].x - table_extent_[0].x > abs(cloud_extent[0].x - center.x) + 0.03) {
+					//path.push_back(temp);		//path[1]:: On the cloud
+					temp.x -= abs(cloud_extent[0].x - center.x) + 0.03;
+					path.push_back(temp);		//path[2]: In X direction
+				} else if (cloud_extent[0].x - table_extent_[0].x > 0.1) {
+					//path.push_back(temp);		//path[1]:: On the cloud
+					temp.x -= 0.06;
+					path.push_back(temp);		//path[2]: In X direction
+				}
+			} else {
+				//Top 2 regions
+				//if (table_extent_[1].x - cloud_extent[1].x > abs(cloud_extent[1].x - center.x + 0.01)) {
+				if (0.8 - cloud_extent[1].x > abs(cloud_extent[1].x - center.x)) {
+					//path.push_back(temp);		//path[1]:: On the cloud
+					temp.x += abs(cloud_extent[1].x - center.x) + 0.03;
+					path.push_back(temp);
+				} else if (0.8 - cloud_extent[1].x > 0.1) {//(table_extent_[1].x - cloud_extent[1].x > 0.1) {
+					//path.push_back(temp);		//path[1]:: On the cloud
+					temp.x += 0.06;
+					path.push_back(temp);		//path[2]: In X direction
+				}
+			}
+
+			if (i == 0 || i == 1) {
+				//Right 2 regions
+				if (cloud_extent[2].y - table_extent_[2].y > abs(cloud_extent[2].y - center.y) + 0.03) {
+					//path.push_back(temp);		//path[1]:: On the cloud
+					temp.y -= abs(cloud_extent[2].y - center.y) + 0.03;
+					path.push_back(temp);
+				} else if (cloud_extent[2].y - table_extent_[2].y > 0.1) {
+					//path.push_back(temp);		//path[1]:: On the cloud
+					temp.y -= 0.06;
+					path.push_back(temp);		//path[3]: In Y direction
+				}
+			} else {
+				//Left 2 regions
+				//temp.y -= 0.05;
+				if (table_extent_[3].y - cloud_extent[3].y > abs(cloud_extent[3].y - center.y) + 0.03) {
+					//path.push_back(temp);		//path[1]:: On the cloud
+					temp.y += abs(cloud_extent[3].y - center.y) + 0.03;
+					path.push_back(temp);
+				} else if (table_extent_[3].y - cloud_extent[3].y > 0.1) {
+					//path.push_back(temp);		//path[1]:: On the cloud
+					temp.y += 0.06;
+					path.push_back(temp);		//path[3]: In Y direction
+				}
+			}
+		}
 		temp.z += 0.1;
 		path.push_back(temp);			//path[4]: Over the cloud
 
@@ -839,12 +995,6 @@ namespace sort_duplos
 			desired_pose.pose.orientation.y = q4.getY();
 			desired_pose.pose.orientation.z = q4.getZ();
 			desired_pose.pose.orientation.w = q4.getW();
-
-			/*desired_pose.pose.orientation.x = -0.74;//-0.06; //
-			desired_pose.pose.orientation.y = -0.04; //0.72;	//
-			desired_pose.pose.orientation.z = 0.67; //0.007;	//
-			desired_pose.pose.orientation.w = -0.04; //0.68;	//
-			*/
 		} else if (action == 0) {
 			// specify rotation in rpy or other methods (euler)
 			tf::Transform t1, t2, t3;
