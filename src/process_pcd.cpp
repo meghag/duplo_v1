@@ -105,7 +105,7 @@ namespace sort_duplos {
 
 		/********** Now filter the object cloud based on table dimensions *********/
 		pass_through_gen(everything_else,object_cloud,true,extent[0].x, extent[1].x-0.05,
-		                 true,extent[2].y+0.01,extent[3].y-0.005,true,extent[5].z-0.01,extent[5].z+0.15);
+		                 true,extent[2].y+0.01,extent[3].y-0.005,true,extent[5].z-0.01,extent[5].z+0.11);
 		pubCloud("object_cloud", object_cloud, "base_link");
 
 		//pcl::io::savePCDFileASCII ("object_try.pcd", *object_cloud);
@@ -188,7 +188,7 @@ namespace sort_duplos {
 
 			std::vector<pcl::PointIndices> cluster_indices;
 			pcl::EuclideanClusterExtraction<pcl::PointXYZRGB> ec;
-			ec.setClusterTolerance (0.03); // 3 cm
+			ec.setClusterTolerance (0.02); // 3 cm
 			//ec.setMinClusterSize (150);
 			ec.setMinClusterSize(50);
 			ec.setMaxClusterSize (30000);
@@ -256,7 +256,7 @@ namespace sort_duplos {
 			return 1;
 		}
 
-		size_t max_duplos = 15;
+		/*size_t max_duplos = 15;
 		
 		for (size_t i = 0; i < min(max_duplos,clusters.size()); i++) 
 			count.push_back(0);
@@ -280,13 +280,14 @@ namespace sort_duplos {
 			ROS_INFO("DUPLO: Region %d: block %zu touches %d other bricks", region_id, i+1, count[i]);
 
 		int max_count = *max_element(count.begin(), count.end());	
+*/
 
 		vector<geometry_msgs::Point> extent = find_extents(*cloud);
-		if(max_count < 1 && (extent[5].z - extent[4].z < 0.035)) {
+		/*if(max_count < 1 && (extent[5].z - extent[4].z < 0.035)) {
 			//Classify the region as uncluttered
 			ROS_INFO("DUPLO: Region %d is uncluttered",region_id);
 			return 1;
-		}
+		}*/
 
 		ROS_INFO("DUPLO: Height of region %d = %f", region_id, extent[5].z - extent[4].z);
 		if (extent[5].z - extent[4].z < 0.05) {
